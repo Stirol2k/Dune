@@ -4,28 +4,40 @@
 --   • cumulative_volume_usd — cumulative volume   (hockey-stick line)
 --   • wow_pct               — Week-over-Week growth, % (line)
 --
--- Window is computed automatically:
---   • start = Monday of the week of the FIRST transfer touching the pool
---   • end   = current_date (UTC)
---   No hardcoded dates — every re-run picks up new data up to the latest tx.
+-- Contract (LiquoriceSettlement, deployed via Deterministic Deployer):
+--   0x0448633eb8b0a42efed924c42069e0dcf08fb552
+--   Same address on every supported chain (CREATE2 from Deterministic Deployer).
 --
--- Volume logic is identical to dune_weekly_volume_52w.sql
---   (LendingPool: 0x046ffb0dfde6a21b4fc609841f55c31b6297cfb8)
+-- Chains covered:
+--   • ethereum
+--   • arbitrum
+--
+-- Window is computed automatically:
+--   • start = Monday of the week of the FIRST transfer on ANY chain (UTC)
+--   • end   = current_date (UTC)
+--
+-- Volume logic is identical to dune_weekly_volume_52w.sql.
+-- One row per (week, chain), plus a synthetic 'all' chain for totals.
 -- =============================================================================
 
 WITH
   pool AS (
-    SELECT from_hex('046ffb0dfde6a21b4fc609841f55c31b6297cfb8') AS addr
+    SELECT from_hex('0448633eb8b0a42efed924c42069e0dcf08fb552') AS addr
   ),
 
-  /* Safety lower bound for scanning tokens.transfers — purely for query cost.
-     The contract was deployed later than this, so it does not affect results. */
+  chains AS (
+    SELECT 'ethereum' AS chain UNION ALL
+    SELECT 'arbitrum'
+  ),
+
+  /* LiquoriceSettlement deployed 2025-09-09 — keep floor a bit before that */
   scan_floor AS (
-    SELECT DATE '2024-01-01' AS floor_d
+    SELECT DATE '2025-09-01' AS floor_d
   ),
 
   legs AS (
     SELECT
+      t.blockchain AS chain,
       t.block_time,
       t.tx_hash,
       t."from" AS f,
@@ -34,58 +46,59 @@ WITH
     FROM tokens.transfers t
     CROSS JOIN pool p
     CROSS JOIN scan_floor s
-    WHERE t.blockchain = 'ethereum'
+    WHERE t.blockchain IN ('ethereum', 'arbitrum')
       AND t.block_time >= CAST(s.floor_d AS timestamp)
       AND (t."from" = p.addr OR t."to" = p.addr)
   ),
 
   by_tx AS (
     SELECT
+      l.chain,
       l.tx_hash,
       MIN(l.block_time) AS block_time_min,
       SUM(CASE WHEN l.tto = p.addr THEN l.leg_usd ELSE 0 END) AS in_usd,
       SUM(CASE WHEN l.f   = p.addr THEN l.leg_usd ELSE 0 END) AS out_usd
     FROM legs l
     CROSS JOIN pool p
-    GROUP BY l.tx_hash
+    GROUP BY l.chain, l.tx_hash
   ),
 
   tx_vol AS (
-    SELECT
-      tx_hash,
-      block_time_min,
-      GREATEST(in_usd, out_usd) AS vol_usd
+    SELECT chain, tx_hash, block_time_min, GREATEST(in_usd, out_usd) AS vol_usd
     FROM by_tx
   ),
 
   daily AS (
     SELECT
+      chain,
       CAST(block_time_min AS date) AS day_utc,
       SUM(vol_usd) AS volume_usd
     FROM tx_vol
-    GROUP BY 1
+    GROUP BY chain, CAST(block_time_min AS date)
   ),
 
   weekly AS (
     SELECT
+      chain,
       CAST(DATE_TRUNC('week', CAST(day_utc AS timestamp)) AS date) AS week_start_utc_monday,
       SUM(volume_usd) AS volume_usd
     FROM daily
-    GROUP BY 1
+    GROUP BY chain, CAST(DATE_TRUNC('week', CAST(day_utc AS timestamp)) AS date)
   ),
 
-  /* Auto window: first week with data → current week (UTC) */
+  /* Auto window: first week with data on ANY chain → current week (UTC) */
   win AS (
     SELECT
       (SELECT MIN(week_start_utc_monday) FROM weekly) AS start_w,
       CAST(DATE_TRUNC('week', CAST(current_date AS timestamp)) AS date) AS end_w
   ),
 
-  /* Continuous week axis so bars have no gaps and WoW LAG is correct */
   week_axis AS (
     SELECT
+      c.chain,
       CAST(date_add('day', 7 * s, w.start_w) AS date) AS week_start_utc_monday
     FROM win w
+    CROSS JOIN chains c
     CROSS JOIN UNNEST(
       sequence(0, CAST(date_diff('week', w.start_w, w.end_w) AS bigint))
     ) AS u(s)
@@ -93,11 +106,22 @@ WITH
 
   weekly_full AS (
     SELECT
+      a.chain,
       a.week_start_utc_monday,
       COALESCE(w.volume_usd, 0) AS volume_usd
     FROM week_axis a
     LEFT JOIN weekly w
-      ON w.week_start_utc_monday = a.week_start_utc_monday
+      ON w.chain                 = a.chain
+     AND w.week_start_utc_monday = a.week_start_utc_monday
+  ),
+
+  /* Synthetic 'all' chain = sum across chains */
+  with_all AS (
+    SELECT chain, week_start_utc_monday, volume_usd FROM weekly_full
+    UNION ALL
+    SELECT 'all' AS chain, week_start_utc_monday, SUM(volume_usd) AS volume_usd
+    FROM weekly_full
+    GROUP BY week_start_utc_monday
   ),
 
   /* Tunables for WoW readability:
@@ -111,36 +135,45 @@ WITH
       CAST(300    AS double) AS wow_cap_pct    /* clip to ±300% */
   ),
 
-  /* Step 1: window functions over the raw weekly series */
+  /* Step 1: window functions over the raw weekly series, partitioned by chain */
   enriched AS (
     SELECT
+      f.chain,
       f.week_start_utc_monday,
       f.volume_usd,
 
-      /* Cumulative volume — "hockey stick" line */
-      SUM(f.volume_usd) OVER (ORDER BY f.week_start_utc_monday) AS cumulative_volume_usd,
+      SUM(f.volume_usd) OVER (
+        PARTITION BY f.chain
+        ORDER BY f.week_start_utc_monday
+      ) AS cumulative_volume_usd,
 
-      /* Trailing 4-week average — smoother base for growth calc */
       AVG(f.volume_usd) OVER (
+        PARTITION BY f.chain
         ORDER BY f.week_start_utc_monday
         ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
       ) AS vol_4w_avg_usd,
 
-      LAG(f.volume_usd, 1) OVER (ORDER BY f.week_start_utc_monday) AS prev_week_vol
-    FROM weekly_full f
+      LAG(f.volume_usd, 1) OVER (
+        PARTITION BY f.chain
+        ORDER BY f.week_start_utc_monday
+      ) AS prev_week_vol
+    FROM with_all f
   ),
 
-  /* Step 2: LAG over the smoothed series (Trino can't nest window funcs,
-     so we do it in a separate CTE) */
+  /* Step 2: LAG over the smoothed series (Trino can't nest window funcs) */
   enriched2 AS (
     SELECT
       e.*,
-      LAG(e.vol_4w_avg_usd, 1) OVER (ORDER BY e.week_start_utc_monday) AS prev_4w_avg
+      LAG(e.vol_4w_avg_usd, 1) OVER (
+        PARTITION BY e.chain
+        ORDER BY e.week_start_utc_monday
+      ) AS prev_4w_avg
     FROM enriched e
   )
 
 SELECT
   e.week_start_utc_monday,
+  e.chain,
   e.volume_usd,
   e.cumulative_volume_usd,
 
@@ -176,4 +209,4 @@ SELECT
   END AS growth_4w_avg_pct
 FROM enriched2 e
 CROSS JOIN knobs k
-ORDER BY e.week_start_utc_monday
+ORDER BY e.week_start_utc_monday, e.chain
