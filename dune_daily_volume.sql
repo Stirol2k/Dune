@@ -1,50 +1,61 @@
 -- =============================================================================
--- Daily trading volume (USD) — full settlement history, multi-chain.
+-- Daily settled volume (USD), full settlement history, multi-chain.
+-- Basis: TradeOrder events emitted by LiquoriceSettlement, one event per
+-- settled order.
 --
--- Contract (LiquoriceSettlement, deployed via Deterministic Deployer):
---   0x0448633eb8b0a42efed924c42069e0dcf08fb552
---   Same address on every supported chain (CREATE2 from Deterministic Deployer).
+-- Contracts (LiquoriceSettlement, deployed via Deterministic Deployer / CREATE2,
+-- same address on every supported chain). All versions are tracked:
+--   v1    0x0448633eb8b0a42efed924c42069e0dcf08fb552   live 2025-09-09 (Ethereum block 23326100)
+--   v1.5  0x43dcd6586e6209ee7235a21bdc4aa301e5bc44e8   live 2026-08-05 (Ethereum block 25689471)
+-- (pre-v1 test contracts from Dec 2024 / Feb 2025 are excluded here on
+--  purpose: volume history starts with v1. They are in dune_trades_history.sql.)
 --
 -- Chains covered:
---   • ethereum
---   • arbitrum
--- (To add another EVM chain: append it to `chains` and `WHERE blockchain IN ...`)
+--   * ethereum
+--   * arbitrum
+-- (To add another EVM chain: add a UNION ALL branch in `raw_logs` and a row in
+--  `chains`. To add another settlement version: append a row to `settlements`,
+--  and to `topics` if the event layout changed.)
+--
+-- Why events and not token transfers: some routes (hooks / interactions) pass
+-- both legs of a swap through the settlement contract, so counting transfers
+-- that touch the settlement double-counts those trades (all Arbitrum flow
+-- since Feb 2026 is like this). Other routes settle straight from a maker
+-- wallet and never touch the settlement balance, so transfers miss them.
+-- TradeOrder is emitted exactly once per settled order on every path, so it
+-- is the exact record.
+--
+-- Method:
+--   * decode TradeOrder from ethereum.logs / arbitrum.logs (two layouts, see
+--     dune_trades_history.sql for the word offsets)
+--   * trade_usd = base amount x prices.day price of the base token on the trade
+--     day; quote side x its price as fallback when the base has no quote
+--   * volume per (day, chain) = SUM(trade_usd)
 --
 -- Window is computed automatically:
---   • start = day of the FIRST transfer touching the contract on ANY chain (UTC)
---   • end   = current_date (UTC)
---   No hardcoded dates — every re-run picks up new data up to the latest tx.
---
--- Logic (mirrors analyze_volume.py / dune_weekly_volume_52w.sql):
---   • Each row in tokens.transfers = an ERC-20 transfer leg touching the contract
---     (from = pool OR to = pool). `tokens.transfers` is the unified multi-chain
---     view; `t.blockchain` carries the chain name.
---   • IN_usd  = sum of legs where the token arrives at the pool (to = pool)
---   • OUT_usd = sum of legs where the token leaves the pool   (from = pool)
---   • Per (chain, tx_hash): vol_usd = GREATEST(IN, OUT)   (avoids double-counting
---     swaps; tx_hash is NOT globally unique across chains, so chain MUST be in
---     every grouping/partition key).
---   • Day (UTC): date of MIN(block_time) for that tx
---   • Final: sum of vol_usd across all txs in the (day, chain) bucket
---
--- Pricing: tokens.transfers.amount_usd (Dune oracle).
---          Values may differ slightly from Etherscan USD — this is expected.
+--   * start = day of the FIRST TradeOrder on ANY chain (UTC)
+--   * end   = current_date (UTC)
 --
 -- Output columns (one row per (day_utc, chain), plus 'all' aggregate row):
---   • day_utc                          — X axis
---   • chain                            — 'ethereum' | 'arbitrum' | 'all'
---   • volume_usd                       — bars  (left axis)
---   • cumulative_volume_usd            — line  (right axis, hockey-stick)
---   • vol_7d_avg_usd                   — 7-day rolling avg, smoother trend line
---
--- Recommended Dune chart: stacked bar by chain (filter chain != 'all') OR
--- single line per chain (filter chain). 'all' rows are pre-aggregated totals.
+--   * day_utc                          X axis
+--   * chain                            'ethereum' | 'arbitrum' | 'all'
+--   * volume_usd                       bars  (left axis)
+--   * trades                           number of settled orders
+--   * cumulative_volume_usd            line  (right axis, hockey-stick)
+--   * vol_7d_avg_usd                   7-day rolling avg, smoother trend line
 -- =============================================================================
 
 WITH
-  pool AS (
-    /* contract address as varbinary (no 0x prefix) — compared directly to from/to */
-    SELECT from_hex('0448633eb8b0a42efed924c42069e0dcf08fb552') AS addr
+  settlements AS (
+    SELECT from_hex('0448633eb8b0a42efed924c42069e0dcf08fb552') AS addr, 'v1'   AS version
+    UNION ALL
+    SELECT from_hex('43dcd6586e6209ee7235a21bdc4aa301e5bc44e8'),          'v1.5'
+  ),
+
+  topics AS (
+    SELECT 0x0fce007c38c6c8ed9e545b3a148095762738618f8c21b673222613e4d45734b6 AS topic0, 'v1'   AS layout
+    UNION ALL
+    SELECT 0x26357f6024689f750d018696a0e2ff7bf56b6fb3ec684bc83a5b84e635d6846f,          'v1.5'
   ),
 
   chains AS (
@@ -52,67 +63,102 @@ WITH
     SELECT 'arbitrum'
   ),
 
-  /* Safety lower bound for scanning tokens.transfers — purely cost optimization.
-     LiquoriceSettlement was deployed 2025-09-09. Widen this if you ever
-     redeploy earlier, but never narrower than the deploy date. */
+  /* Settlement v1 deployed 2025-09-09, keep floor a bit before that. */
   scan_floor AS (
     SELECT DATE '2025-09-01' AS floor_d
   ),
 
-  legs AS (
-    SELECT
-      t.blockchain AS chain,
-      t.block_time,
-      t.tx_hash,
-      t."from" AS f,
-      t."to"   AS tto,
-      COALESCE(t.amount_usd, 0) AS leg_usd
-    FROM tokens.transfers t
-    CROSS JOIN pool p
+  raw_logs AS (
+    SELECT 'ethereum' AS chain, l.block_time, l.tx_hash, l.index AS evt_index, l.topic0, l.data
+    FROM ethereum.logs l
     CROSS JOIN scan_floor s
-    WHERE t.blockchain IN ('ethereum', 'arbitrum')
-      AND t.block_time >= CAST(s.floor_d AS timestamp)
-      AND (t."from" = p.addr OR t."to" = p.addr)
+    WHERE l.block_time >= CAST(s.floor_d AS timestamp)
+      AND l.contract_address IN (SELECT addr FROM settlements)
+      AND l.topic0 IN (SELECT topic0 FROM topics)
+    UNION ALL
+    SELECT 'arbitrum' AS chain, l.block_time, l.tx_hash, l.index AS evt_index, l.topic0, l.data
+    FROM arbitrum.logs l
+    CROSS JOIN scan_floor s
+    WHERE l.block_time >= CAST(s.floor_d AS timestamp)
+      AND l.contract_address IN (SELECT addr FROM settlements)
+      AND l.topic0 IN (SELECT topic0 FROM topics)
   ),
 
-  by_tx AS (
+  decoded AS (
     SELECT
-      l.chain,
-      l.tx_hash,
-      MIN(l.block_time) AS block_time_min,
-      SUM(CASE WHEN l.tto = p.addr THEN l.leg_usd ELSE 0 END) AS in_usd,
-      SUM(CASE WHEN l.f   = p.addr THEN l.leg_usd ELSE 0 END) AS out_usd
-    FROM legs l
-    CROSS JOIN pool p
-    GROUP BY l.chain, l.tx_hash
+      r.chain,
+      CAST(r.block_time AS date) AS day_utc,
+      r.tx_hash,
+      r.evt_index,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_substring(r.data, 109, 20)
+           ELSE varbinary_substring(r.data,  77, 20) END AS base_token,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_substring(r.data, 141, 20)
+           ELSE varbinary_substring(r.data, 109, 20) END AS quote_token,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_to_uint256(varbinary_substring(r.data, 161, 32))
+           ELSE varbinary_to_uint256(varbinary_substring(r.data, 129, 32)) END AS base_amount_raw,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_to_uint256(varbinary_substring(r.data, 193, 32))
+           ELSE varbinary_to_uint256(varbinary_substring(r.data, 161, 32)) END AS quote_amount_raw
+    FROM raw_logs r
+    JOIN topics t ON t.topic0 = r.topic0
   ),
 
-  tx_vol AS (
+  erc20 AS (
+    SELECT blockchain AS chain, contract_address AS token, decimals
+    FROM tokens.erc20
+    WHERE blockchain IN ('ethereum', 'arbitrum')
+  ),
+
+  px AS (
     SELECT
-      chain,
-      tx_hash,
-      block_time_min,
-      GREATEST(in_usd, out_usd) AS vol_usd
-    FROM by_tx
+      p.blockchain                AS chain,
+      p.contract_address          AS token,
+      CAST(p."timestamp" AS date) AS day_utc,
+      MAX(p.price)                AS price_usd
+    FROM prices.day p
+    CROSS JOIN scan_floor s
+    WHERE p.blockchain IN ('ethereum', 'arbitrum')
+      AND p."timestamp" >= CAST(s.floor_d AS timestamp)
+      AND p.contract_address IN (
+            SELECT base_token  FROM decoded
+            UNION
+            SELECT quote_token FROM decoded)
+    GROUP BY p.blockchain, p.contract_address, CAST(p."timestamp" AS date)
+  ),
+
+  trades AS (
+    SELECT
+      d.chain,
+      d.day_utc,
+      COALESCE(
+        CAST(d.base_amount_raw  AS double) / power(10, COALESCE(eb.decimals, 18)) * pb.price_usd,
+        CAST(d.quote_amount_raw AS double) / power(10, COALESCE(eq.decimals, 18)) * pq.price_usd,
+        0
+      ) AS trade_usd
+    FROM decoded d
+    LEFT JOIN erc20 eb ON eb.chain = d.chain AND eb.token = d.base_token
+    LEFT JOIN erc20 eq ON eq.chain = d.chain AND eq.token = d.quote_token
+    LEFT JOIN px pb ON pb.chain = d.chain AND pb.token = d.base_token  AND pb.day_utc = d.day_utc
+    LEFT JOIN px pq ON pq.chain = d.chain AND pq.token = d.quote_token AND pq.day_utc = d.day_utc
   ),
 
   daily AS (
-    SELECT
-      chain,
-      CAST(block_time_min AS date) AS day_utc,
-      SUM(vol_usd) AS volume_usd
-    FROM tx_vol
-    GROUP BY chain, CAST(block_time_min AS date)
+    SELECT chain, day_utc, SUM(trade_usd) AS volume_usd, COUNT(*) AS trades
+    FROM trades
+    GROUP BY chain, day_utc
   ),
 
-  /* Auto window: first day with data on ANY chain → today (UTC) */
+  /* Auto window: first day with data on ANY chain -> today (UTC) */
   win AS (
     SELECT
       (SELECT MIN(day_utc) FROM daily) AS start_d,
       current_date                     AS end_d
   ),
 
-  /* Continuous (chain × day) axis so charts have no gaps and rolling avg is correct */
+  /* Continuous (chain x day) axis so charts have no gaps and rolling avg is correct */
   axis AS (
     SELECT
       c.chain,
@@ -128,19 +174,19 @@ WITH
     SELECT
       a.chain,
       a.day_utc,
-      COALESCE(d.volume_usd, 0) AS volume_usd
+      COALESCE(d.volume_usd, 0) AS volume_usd,
+      COALESCE(d.trades,     0) AS trades
     FROM axis a
     LEFT JOIN daily d
       ON d.chain   = a.chain
      AND d.day_utc = a.day_utc
   ),
 
-  /* Add a synthetic 'all' chain = sum across chains, so the chart can show
-     a combined total alongside per-chain breakdown without re-aggregation. */
+  /* Synthetic 'all' chain = sum across chains */
   with_all AS (
-    SELECT chain, day_utc, volume_usd FROM daily_full
+    SELECT chain, day_utc, volume_usd, trades FROM daily_full
     UNION ALL
-    SELECT 'all' AS chain, day_utc, SUM(volume_usd) AS volume_usd
+    SELECT 'all' AS chain, day_utc, SUM(volume_usd), SUM(trades)
     FROM daily_full
     GROUP BY day_utc
   )
@@ -149,11 +195,8 @@ SELECT
   day_utc,
   chain,
   volume_usd,
-
-  /* Cumulative volume per chain — hockey-stick line */
+  trades,
   SUM(volume_usd) OVER (PARTITION BY chain ORDER BY day_utc) AS cumulative_volume_usd,
-
-  /* 7-day rolling average per chain — smoother trend line */
   AVG(volume_usd) OVER (
     PARTITION BY chain
     ORDER BY day_utc

@@ -1,37 +1,59 @@
 -- =============================================================================
--- Weekly volume (USD) — full settlement history, multi-chain.
+-- Weekly settled volume (USD), full settlement history, multi-chain.
+-- Basis: TradeOrder events emitted by LiquoriceSettlement, one event per
+-- settled order.
 --
--- Contract (LiquoriceSettlement, deployed via Deterministic Deployer):
---   0x0448633eb8b0a42efed924c42069e0dcf08fb552
---   Same address on every supported chain (CREATE2 from Deterministic Deployer).
+-- Contracts (LiquoriceSettlement, deployed via Deterministic Deployer / CREATE2,
+-- same address on every supported chain). All versions are tracked:
+--   v1    0x0448633eb8b0a42efed924c42069e0dcf08fb552   live 2025-09-09 (Ethereum block 23326100)
+--   v1.5  0x43dcd6586e6209ee7235a21bdc4aa301e5bc44e8   live 2026-08-05 (Ethereum block 25689471)
+-- (pre-v1 test contracts from Dec 2024 / Feb 2025 are excluded here on
+--  purpose: volume history starts with v1. They are in dune_trades_history.sql.)
 --
 -- Chains covered:
---   • ethereum
---   • arbitrum
+--   * ethereum
+--   * arbitrum
+-- (To add another EVM chain: add a UNION ALL branch in `raw_logs` and a row in
+--  `chains`. To add another settlement version: append a row to `settlements`,
+--  and to `topics` if the event layout changed.)
+--
+-- Why events and not token transfers: some routes (hooks / interactions) pass
+-- both legs of a swap through the settlement contract, so counting transfers
+-- that touch the settlement double-counts those trades (all Arbitrum flow
+-- since Feb 2026 is like this). Other routes settle straight from a maker
+-- wallet and never touch the settlement balance, so transfers miss them.
+-- TradeOrder is emitted exactly once per settled order on every path, so it
+-- is the exact record.
+--
+-- Method:
+--   * decode TradeOrder from ethereum.logs / arbitrum.logs (two layouts, see
+--     dune_trades_history.sql for the word offsets)
+--   * trade_usd = base amount x prices.day price of the base token on the trade
+--     day; quote side x its price as fallback when the base has no quote
+--   * volume per (day, chain) = SUM(trade_usd)
 --
 -- Window is computed automatically:
---   • start = Monday of the week of the FIRST transfer on ANY chain (UTC)
---   • end   = current_date (UTC)
---   Every re-run picks up new data up to the latest transaction.
---
--- Logic (mirrors analyze_volume.py):
---   • Each row in tokens.transfers = an ERC-20 transfer leg touching the contract.
---   • IN_usd  = sum of legs where the token arrives at the pool (to = pool)
---   • OUT_usd = sum of legs where the token leaves the pool   (from = pool)
---   • Per (chain, tx_hash): vol_usd = GREATEST(IN, OUT)   (avoid double-counting;
---     tx_hash is NOT globally unique — chain MUST be in every grouping key).
---   • Day (UTC): date of MIN(block_time) for that tx
---   • Week: Monday UTC — date_trunc('week', day)
---   • Final: sum of vol_usd across all days in the (week, chain) bucket
---
--- Pricing: tokens.transfers.amount_usd (Dune oracle).
+--   * start = day of the FIRST TradeOrder on ANY chain (UTC)
+--   * end   = current_date (UTC)
 --
 -- Output: one row per (week_start_utc_monday, chain) plus 'all' aggregate.
+--   * week_start_utc_monday            Monday UTC, date_trunc('week', day)
+--   * chain                            'ethereum' | 'arbitrum' | 'all'
+--   * volume_usd, trades
+--   * cumulative_volume_usd
 -- =============================================================================
 
 WITH
-  pool AS (
-    SELECT from_hex('0448633eb8b0a42efed924c42069e0dcf08fb552') AS addr
+  settlements AS (
+    SELECT from_hex('0448633eb8b0a42efed924c42069e0dcf08fb552') AS addr, 'v1'   AS version
+    UNION ALL
+    SELECT from_hex('43dcd6586e6209ee7235a21bdc4aa301e5bc44e8'),          'v1.5'
+  ),
+
+  topics AS (
+    SELECT 0x0fce007c38c6c8ed9e545b3a148095762738618f8c21b673222613e4d45734b6 AS topic0, 'v1'   AS layout
+    UNION ALL
+    SELECT 0x26357f6024689f750d018696a0e2ff7bf56b6fb3ec684bc83a5b84e635d6846f,          'v1.5'
   ),
 
   chains AS (
@@ -39,67 +61,105 @@ WITH
     SELECT 'arbitrum'
   ),
 
-  /* LiquoriceSettlement deployed 2025-09-09 — keep floor a bit before that */
+  /* Settlement v1 deployed 2025-09-09, keep floor a bit before that. */
   scan_floor AS (
     SELECT DATE '2025-09-01' AS floor_d
   ),
 
-  legs AS (
-    SELECT
-      t.blockchain AS chain,
-      t.block_time,
-      t.tx_hash,
-      t."from" AS f,
-      t."to"   AS tto,
-      COALESCE(t.amount_usd, 0) AS leg_usd
-    FROM tokens.transfers t
-    CROSS JOIN pool p
+  raw_logs AS (
+    SELECT 'ethereum' AS chain, l.block_time, l.tx_hash, l.index AS evt_index, l.topic0, l.data
+    FROM ethereum.logs l
     CROSS JOIN scan_floor s
-    WHERE t.blockchain IN ('ethereum', 'arbitrum')
-      AND t.block_time >= CAST(s.floor_d AS timestamp)
-      AND (t."from" = p.addr OR t."to" = p.addr)
+    WHERE l.block_time >= CAST(s.floor_d AS timestamp)
+      AND l.contract_address IN (SELECT addr FROM settlements)
+      AND l.topic0 IN (SELECT topic0 FROM topics)
+    UNION ALL
+    SELECT 'arbitrum' AS chain, l.block_time, l.tx_hash, l.index AS evt_index, l.topic0, l.data
+    FROM arbitrum.logs l
+    CROSS JOIN scan_floor s
+    WHERE l.block_time >= CAST(s.floor_d AS timestamp)
+      AND l.contract_address IN (SELECT addr FROM settlements)
+      AND l.topic0 IN (SELECT topic0 FROM topics)
   ),
 
-  by_tx AS (
+  decoded AS (
     SELECT
-      l.chain,
-      l.tx_hash,
-      MIN(l.block_time) AS block_time_min,
-      SUM(CASE WHEN l.tto = p.addr THEN l.leg_usd ELSE 0 END) AS in_usd,
-      SUM(CASE WHEN l.f   = p.addr THEN l.leg_usd ELSE 0 END) AS out_usd
-    FROM legs l
-    CROSS JOIN pool p
-    GROUP BY l.chain, l.tx_hash
+      r.chain,
+      CAST(r.block_time AS date) AS day_utc,
+      r.tx_hash,
+      r.evt_index,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_substring(r.data, 109, 20)
+           ELSE varbinary_substring(r.data,  77, 20) END AS base_token,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_substring(r.data, 141, 20)
+           ELSE varbinary_substring(r.data, 109, 20) END AS quote_token,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_to_uint256(varbinary_substring(r.data, 161, 32))
+           ELSE varbinary_to_uint256(varbinary_substring(r.data, 129, 32)) END AS base_amount_raw,
+      CASE WHEN t.layout = 'v1.5'
+           THEN varbinary_to_uint256(varbinary_substring(r.data, 193, 32))
+           ELSE varbinary_to_uint256(varbinary_substring(r.data, 161, 32)) END AS quote_amount_raw
+    FROM raw_logs r
+    JOIN topics t ON t.topic0 = r.topic0
   ),
 
-  tx_vol AS (
+  erc20 AS (
+    SELECT blockchain AS chain, contract_address AS token, decimals
+    FROM tokens.erc20
+    WHERE blockchain IN ('ethereum', 'arbitrum')
+  ),
+
+  px AS (
     SELECT
-      chain,
-      tx_hash,
-      block_time_min,
-      GREATEST(in_usd, out_usd) AS vol_usd
-    FROM by_tx
+      p.blockchain                AS chain,
+      p.contract_address          AS token,
+      CAST(p."timestamp" AS date) AS day_utc,
+      MAX(p.price)                AS price_usd
+    FROM prices.day p
+    CROSS JOIN scan_floor s
+    WHERE p.blockchain IN ('ethereum', 'arbitrum')
+      AND p."timestamp" >= CAST(s.floor_d AS timestamp)
+      AND p.contract_address IN (
+            SELECT base_token  FROM decoded
+            UNION
+            SELECT quote_token FROM decoded)
+    GROUP BY p.blockchain, p.contract_address, CAST(p."timestamp" AS date)
+  ),
+
+  trades AS (
+    SELECT
+      d.chain,
+      d.day_utc,
+      COALESCE(
+        CAST(d.base_amount_raw  AS double) / power(10, COALESCE(eb.decimals, 18)) * pb.price_usd,
+        CAST(d.quote_amount_raw AS double) / power(10, COALESCE(eq.decimals, 18)) * pq.price_usd,
+        0
+      ) AS trade_usd
+    FROM decoded d
+    LEFT JOIN erc20 eb ON eb.chain = d.chain AND eb.token = d.base_token
+    LEFT JOIN erc20 eq ON eq.chain = d.chain AND eq.token = d.quote_token
+    LEFT JOIN px pb ON pb.chain = d.chain AND pb.token = d.base_token  AND pb.day_utc = d.day_utc
+    LEFT JOIN px pq ON pq.chain = d.chain AND pq.token = d.quote_token AND pq.day_utc = d.day_utc
   ),
 
   daily AS (
-    SELECT
-      chain,
-      CAST(block_time_min AS date) AS day_utc,
-      SUM(vol_usd) AS volume_usd
-    FROM tx_vol
-    GROUP BY chain, CAST(block_time_min AS date)
+    SELECT chain, day_utc, SUM(trade_usd) AS volume_usd, COUNT(*) AS trades
+    FROM trades
+    GROUP BY chain, day_utc
   ),
 
   weekly AS (
     SELECT
       chain,
       CAST(DATE_TRUNC('week', CAST(day_utc AS timestamp)) AS date) AS week_start_utc_monday,
-      SUM(volume_usd) AS volume_usd
+      SUM(volume_usd) AS volume_usd,
+      SUM(trades)     AS trades
     FROM daily
     GROUP BY chain, CAST(DATE_TRUNC('week', CAST(day_utc AS timestamp)) AS date)
   ),
 
-  /* Auto window: first week with data on ANY chain → current week */
+  /* Auto window: first week with data on ANY chain -> current week */
   win AS (
     SELECT
       (SELECT MIN(week_start_utc_monday) FROM weekly) AS start_w,
@@ -121,7 +181,8 @@ WITH
     SELECT
       a.chain,
       a.week_start_utc_monday,
-      COALESCE(w.volume_usd, 0) AS volume_usd
+      COALESCE(w.volume_usd, 0) AS volume_usd,
+      COALESCE(w.trades,     0) AS trades
     FROM week_axis a
     LEFT JOIN weekly w
       ON w.chain                 = a.chain
@@ -130,9 +191,9 @@ WITH
 
   /* Synthetic 'all' chain = sum across chains */
   with_all AS (
-    SELECT chain, week_start_utc_monday, volume_usd FROM weekly_full
+    SELECT chain, week_start_utc_monday, volume_usd, trades FROM weekly_full
     UNION ALL
-    SELECT 'all' AS chain, week_start_utc_monday, SUM(volume_usd) AS volume_usd
+    SELECT 'all' AS chain, week_start_utc_monday, SUM(volume_usd), SUM(trades)
     FROM weekly_full
     GROUP BY week_start_utc_monday
   )
@@ -141,6 +202,7 @@ SELECT
   week_start_utc_monday,
   chain,
   volume_usd,
+  trades,
   SUM(volume_usd) OVER (PARTITION BY chain ORDER BY week_start_utc_monday) AS cumulative_volume_usd
 FROM with_all
 ORDER BY week_start_utc_monday, chain
